@@ -894,10 +894,15 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
     can_unload = []
     unloaded_models = []
 
+    explicit_unload = memory_required >= 1e29
     for i in range(len(current_loaded_models) -1, -1, -1):
         shift_model = current_loaded_models[i]
         if device is None or shift_model.device == device:
             if shift_model not in keep_loaded and not shift_model.is_dead():
+                # Unloading a model whose offload_device equals its resident device frees zero VRAM
+                # and only forces slow weight re-patching/synchronization on the next step.
+                if not explicit_unload and getattr(shift_model.model, "offload_device", None) == shift_model.device:
+                    continue
                 can_unload.append((-shift_model.model_offloaded_memory(), sys.getrefcount(shift_model.model), shift_model.model_memory(), i))
                 shift_model.currently_used = False
 

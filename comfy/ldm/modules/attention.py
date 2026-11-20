@@ -608,11 +608,15 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
         if mask.ndim == 3:
             mask = mask.unsqueeze(1)
 
-    sdpa_keys = ("scale", "enable_gqa")
+    sdpa_keys = ("scale", "enable_gqa", "is_causal")
     sdpa_extra = {k: v for k, v in kwargs.items() if k in sdpa_keys}
+    if mask is not None:
+        sdpa_extra["is_causal"] = False
+    else:
+        sdpa_extra.setdefault("is_causal", False)
 
     if SDP_BATCH_LIMIT >= b:
-        out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, **sdpa_extra)
+        out = comfy.ops.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, **sdpa_extra)
         if not skip_output_reshape:
             out = (
                 out.transpose(1, 2).reshape(b, -1, heads * dim_head)
@@ -630,7 +634,7 @@ def attention_pytorch(q, k, v, heads, mask=None, attn_precision=None, skip_resha
                 k[i : i + SDP_BATCH_LIMIT],
                 v[i : i + SDP_BATCH_LIMIT],
                 attn_mask=m,
-                dropout_p=0.0, is_causal=False, **sdpa_extra
+                dropout_p=0.0, **sdpa_extra
             ).transpose(1, 2).reshape(-1, q.shape[2], heads * dim_head)
     return out
 

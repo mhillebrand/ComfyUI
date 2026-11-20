@@ -189,7 +189,7 @@ class Attention(nn.Module):
             qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
             kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
             rot = rope_freqs.shape[-3] * 2
-            if comfy.model_management.in_training:
+            if comfy.model_management.in_training or torch.compiler.is_compiling():
                 q, k = comfy.quant_ops.ck.rms_rope_split_half(
                     q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
             else:
@@ -256,10 +256,11 @@ def _mod_row(vecs, row, dtype):
     return vecs[row].to(dtype)
 
 
-def _mod_scale_shift(h, shift, scale, segments):
+def _mod_scale_shift(h, shift, scale, segments, add_one=True):
     # segments: [(start, stop, mod_row)] covering h contiguously.
     for a, b, row in segments:
-        h[a:b].mul_(1.0 + _mod_row(scale, row, h.dtype)).add_(_mod_row(shift, row, h.dtype))
+        s = _mod_row(scale, row, h.dtype)
+        h[a:b].mul_((1.0 + s) if add_one else s).add_(_mod_row(shift, row, h.dtype))
     return h
 
 
@@ -314,10 +315,15 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
         attention = self.attn if attention is None else attention
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
-        h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
+        dtype = x.dtype
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            t.to(dtype) for t in self.adaln_proj(t_emb)
+        )
+        scale_msa = 1.0 + scale_msa
+        scale_mlp = 1.0 + scale_mlp
+        h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments, add_one=False)
         x = _mod_gate(x, gate_msa, attention(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
-        h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
+        h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments, add_one=False)
         return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
 
@@ -595,13 +601,12 @@ class MiniMaxH3Model(nn.Module):
     def _embed_and_pack(self, video_x, audio_x, context, layout, payload, transformer_options):
         device = video_x.device
         dtype = context.dtype
-        img_update = layout.img_update.to(device)
-        audio_update = layout.audio_update.to(device)
         video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
         cond_video_rows = self._cond_video_rows(payload, device)
 
         all_video_rows = video_rows
         if cond_video_rows is not None:
+            img_update = layout.img_update.to(device)
             all_video_rows = torch.empty(img_update.shape[0], video_rows.shape[1], dtype=torch.float32, device=device)
             all_video_rows[~img_update] = cond_video_rows
             all_video_rows[img_update] = video_rows
@@ -612,6 +617,7 @@ class MiniMaxH3Model(nn.Module):
             cond_audio_rows = self._cond_audio_rows(payload, device)
             all_audio_rows = audio_rows
             if cond_audio_rows is not None:
+                audio_update = layout.audio_update.to(device)
                 all_audio_rows = torch.empty(audio_update.shape[0], audio_rows.shape[1], dtype=torch.float32, device=device)
                 all_audio_rows[~audio_update] = cond_audio_rows
                 all_audio_rows[audio_update] = audio_rows
@@ -649,7 +655,17 @@ class MiniMaxH3Model(nn.Module):
     def _run_blocks(self, h, t_emb, mod_segments, layout, transformer_options):
         device = h.device
         # rotation table computed once per forward, consumed by the kitchen split-half rope
-        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), h.dtype)
+        can_cache_rope = not comfy.model_management.in_training and not torch.compiler.is_compiling()
+        rope_freqs = None
+        if can_cache_rope:
+            cache = getattr(layout, "_rope_cache", None)
+            cache_key = (id(self.rope.inv_freq), self.rope.inv_freq.data_ptr(), self.rope.inv_freq.device, device, h.dtype)
+            if cache is not None and cache[0] == cache_key:
+                rope_freqs = cache[1]
+        if rope_freqs is None:
+            rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), h.dtype)
+            if can_cache_rope:
+                layout._rope_cache = (cache_key, rope_freqs)
 
         patches_replace = transformer_options.get("patches_replace", {})
         blocks_replace = patches_replace.get("dit", {})

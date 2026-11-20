@@ -415,8 +415,9 @@ def prompt_worker(q, server_instance, asset_manager):
 
             flags = q.get_flags()
             free_memory = flags.get("free_memory", False)
+            explicit_unload = flags.get("unload_models", free_memory)
 
-            if flags.get("unload_models", free_memory):
+            if explicit_unload:
                 comfy.model_management.unload_all_models()
                 need_gc = True
                 last_gc_collect = 0
@@ -426,11 +427,12 @@ def prompt_worker(q, server_instance, asset_manager):
                 need_gc = True
                 last_gc_collect = 0
 
-            if need_gc:
+            if need_gc and (explicit_unload or q.get_tasks_remaining() == 0):
                 current_time = time.perf_counter()
                 if (current_time - last_gc_collect) > gc_collect_interval:
                     gc.collect()
-                    comfy.model_management.soft_empty_cache()
+                    if not args.gpu_only or explicit_unload:
+                        comfy.model_management.soft_empty_cache()
                     last_gc_collect = current_time
                     need_gc = False
                     hook_breaker_ac10a0.restore_functions()

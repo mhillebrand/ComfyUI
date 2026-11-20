@@ -1,3 +1,4 @@
+import functools
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ import comfy.utils
 import comfy_kitchen
 from comfy_kitchen.int8_decode import Int8DecodeCache
 
-from comfy.ldm.modules.attention import optimized_attention_for_device
+from comfy.ldm.modules.attention import attention_pytorch, optimized_attention_for_device
 import comfy.model_management
 import comfy.model_prefetch
 import comfy.ops
@@ -1031,14 +1032,24 @@ class Llama2_(nn.Module):
             mask = mask.masked_fill(mask.to(torch.bool), torch.finfo(x.dtype).min / 4)
 
         spec_decode = fixed_kv and any(isinstance(kv, FixedKVState) for kv in past_key_values) and 2 <= seq_len <= SPEC_ROWS and past_len > 0 and attention_mask is None
-        if seq_len > 1 and not spec_decode:  # spec verify: the staircase decode bias is causal
+        optimized_attention = optimized_attention_for_device(x.device, mask=mask is not None, small_input=True)
+        use_native_causal = (
+            seq_len > 1
+            and not spec_decode
+            and mask is None
+            and past_len == 0
+            and not getattr(self.config, "sliding_attention", None)
+            and optimized_attention is attention_pytorch
+        )
+        if use_native_causal:
+            optimized_attention = functools.partial(optimized_attention, is_causal=True)
+        elif seq_len > 1 and not spec_decode:  # spec verify: the staircase decode bias is causal
             causal_mask = torch.empty(past_len + seq_len, past_len + seq_len, dtype=x.dtype, device=x.device).fill_(torch.finfo(x.dtype).min / 4).triu_(1)
             if mask is not None:
                 mask += causal_mask
             else:
                 mask = causal_mask
-
-        optimized_attention = optimized_attention_for_device(x.device, mask=mask is not None, small_input=True)
+            optimized_attention = optimized_attention_for_device(x.device, mask=mask is not None, small_input=True)
 
         enable_graph = self.graph_dynamic_vbar_blocks and (fixed_kv_decode or spec_decode)
         if enable_graph:
